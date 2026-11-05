@@ -1,6 +1,6 @@
 # Build Mario Kart World IPA for iOS
 # Requires: Game dump hosted at a direct-download URL (Google Drive, Dropbox, etc.)
-# Outputs: MarioKartWorld.ipa (artifact), RomFS.img chunks (artifacts, reassemble locally)
+# Outputs: MarioKartWorld.ipa (artifact), RomFS.img uploaded to GoFile.io (download links in summary)
 
 name: Build Mario Kart World IPA
 
@@ -227,72 +227,123 @@ jobs:
           retention-days: 7
           compression-level: 6
 
-      # ── Handle RomFS.img (split into 2GB chunks for GitHub artifact limits) ─
-      - name: Split and upload RomFS.img chunks
+      # ── Upload RomFS.img to GoFile.io ──────────────────────────────────────
+      - name: Upload RomFS.img to GoFile.io
+        id: gofile
         if: ${{ steps.build.outputs.ROMFS_PATH != '' }}
         env:
           ROMFS_PATH: ${{ steps.build.outputs.ROMFS_PATH }}
         run: |
           set -euo pipefail
           if [[ ! -f "$ROMFS_PATH" ]]; then
-            echo "RomFS.img not found, skipping split"
+            echo "RomFS.img not found, skipping upload"
             exit 0
           fi
 
-          echo "Splitting RomFS.img into 2GB chunks..."
-          SPLIT_DIR="$RUNNER_TEMP/romfs_chunks"
+          ROMFS_SIZE=$(du -h "$ROMFS_PATH" | cut -f1)
+          ROMFS_SIZE_BYTES=$(stat -c%s "$ROMFS_PATH")
+          echo "RomFS.img size: $ROMFS_SIZE ($ROMFS_SIZE_BYTES bytes)"
+
+          # GoFile free tier: 20 GB per file. RomFS.img is ~21.7 GB — split into 2 parts
+          # Split into 2 parts of ~11 GB each (well under 20 GB limit)
+          echo "Splitting RomFS.img into 2 parts for GoFile upload..."
+          SPLIT_DIR="$RUNNER_TEMP/romfs_parts"
           mkdir -p "$SPLIT_DIR"
 
-          # Split into 2GB chunks (1900M to be safe under 2GB limit)
-          split -b 1900M -d -a 3 "$ROMFS_PATH" "$SPLIT_DIR/RomFS.img.part."
+          # Split into 2 equal parts
+          split -n 2 -d -a 1 "$ROMFS_PATH" "$SPLIT_DIR/RomFS.img.part"
 
-          CHUNK_COUNT=$(ls "$SPLIT_DIR" | wc -l)
-          echo "Created $CHUNK_COUNT chunks"
+          PART_COUNT=$(ls "$SPLIT_DIR" | wc -l)
+          echo "Created $PART_COUNT parts"
 
-          # Upload each chunk as separate artifact
-          for i in $(seq -f "%03g" 0 $((CHUNK_COUNT - 1))); do
-            CHUNK_FILE="$SPLIT_DIR/RomFS.img.part.$i"
-            CHUNK_SIZE=$(du -h "$CHUNK_FILE" | cut -f1)
-            echo "Uploading chunk $i ($CHUNK_SIZE)..."
-            # Use a unique artifact name per chunk
-            gh artifact upload "MarioKartWorld-romfs-part-$i" "$CHUNK_FILE" --retention-days=7 || true
+          # Get GoFile server
+          echo "Getting GoFile server..."
+          SERVER_RESPONSE=$(curl -s "https://api.gofile.io/getServer")
+          SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['data']['server'])")
+          if [[ -z "$SERVER" || "$SERVER" == "None" ]]; then
+            echo "::error::Failed to get GoFile server"
+            echo "$SERVER_RESPONSE"
+            exit 1
+          fi
+          echo "Using GoFile server: $SERVER"
+
+          # Upload each part
+          UPLOAD_URLS=()
+          for i in $(seq 0 $((PART_COUNT - 1))); do
+            PART_FILE="$SPLIT_DIR/RomFS.img.part$i"
+            PART_SIZE=$(du -h "$PART_FILE" | cut -f1)
+            echo "Uploading part $i ($PART_SIZE)..."
+
+            UPLOAD_RESPONSE=$(curl -s -F "file=@$PART_FILE" "https://${SERVER}.gofile.io/uploadFile")
+            echo "Upload response: $UPLOAD_RESPONSE"
+
+            DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if data.get('status') == 'ok':
+        print(data['data']['downloadPage'])
+    else:
+        print('ERROR: ' + data.get('message', 'unknown'))
+" 2>/dev/null)
+
+            if [[ "$DOWNLOAD_URL" == ERROR* ]]; then
+              echo "::error::Failed to upload part $i: $DOWNLOAD_URL"
+              exit 1
+            fi
+
+            echo "Part $i uploaded: $DOWNLOAD_URL"
+            UPLOAD_URLS+=("$DOWNLOAD_URL")
           done
 
-          # Also create a manifest for reassembly
-          cat > "$SPLIT_DIR/MANIFEST.txt" <<EOF
-Total chunks: $CHUNK_COUNT
-Original file: RomFS.img
-Split command: split -b 1900M -d -a 3 RomFS.img RomFS.img.part.
-Reassembly: cat RomFS.img.part.* > RomFS.img
+          # Output URLs for summary
+          echo "GOFILE_URLS=${UPLOAD_URLS[*]}" >> $GITHUB_OUTPUT
+          echo "PART_COUNT=$PART_COUNT" >> $GITHUB_OUTPUT
+
+          # Create reassembly instructions
+          cat > "$SPLIT_DIR/REASSEMBLE.txt" <<EOF
+RomFS.img was split into $PART_COUNT parts for GoFile.io upload (20 GB/file limit).
+Each part is ~11 GB.
+
+DOWNLOAD LINKS:
+$(for url in "${UPLOAD_URLS[@]}"; do echo "$url"; done)
+
+TO REASSEMBLE:
+1. Download all parts using the links above
+2. Save as: RomFS.img.part0, RomFS.img.part1
+3. Run: cat RomFS.img.part* > RomFS.img
+4. Verify: sha256sum RomFS.img (should match original if you have it)
+
+OR on Windows PowerShell:
+  cat RomFS.img.part0, RomFS.img.part1 > RomFS.img
 EOF
-          gh artifact upload "MarioKartWorld-romfs-manifest" "$SPLIT_DIR/MANIFEST.txt" --retention-days=7 || true
+
+          cat "$SPLIT_DIR/REASSEMBLE.txt"
 
       # ── Summary ────────────────────────────────────────────────────────────
       - name: Build summary
         run: |
           echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**IPA:** \`MarioKartWorld.ipa\` (download from artifacts)" >> $GITHUB_STEP_SUMMARY
+          echo "**IPA:** \`MarioKartWorld.ipa\` (download from \`MarioKartWorld-ipa\` artifact)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**RomFS.img:** Split into 2GB chunks (download all parts from artifacts)" >> $GITHUB_STEP_SUMMARY
+          echo "**RomFS.img:** Uploaded to GoFile.io (2 parts, ~11 GB each)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ -n "${{ steps.gofile.outputs.GOFILE_URLS }}" ]]; then
+            echo "### RomFS.img Download Links" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for url in ${{ steps.gofile.outputs.GOFILE_URLS }}; do
+              echo "- $url" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "1. Download \`MarioKartWorld-ipa\` artifact" >> $GITHUB_STEP_SUMMARY
-          echo "2. Download all \`MarioKartWorld-romfs-part-*\` artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "3. Reassemble RomFS.img: \`cat RomFS.img.part.* > RomFS.img\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. Download both RomFS.img parts from GoFile.io links above" >> $GITHUB_STEP_SUMMARY
+          echo "3. Reassemble: \`cat RomFS.img.part* > RomFS.img\` (or PowerShell: \`cat RomFS.img.part0, RomFS.img.part1 > RomFS.img\`)" >> $GITHUB_STEP_SUMMARY
           echo "4. Install IPA via LiveContainer on iPhone" >> $GITHUB_STEP_SUMMARY
           echo "5. Copy RomFS.img to LiveContainer Documents folder" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "See [TUTORIAL.md](TUTORIAL.md) for detailed instructions."
-
-  # Alternative: Upload RomFS.img to file hosting (if user provides credentials)
-  # upload-romfs:
-  #   name: Upload RomFS.img to cloud storage
-  #   needs: build
-  #   if: false  # Set to true and configure secrets to enable
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Download RomFS chunks
-  #       uses: actions/download-artifact@...
-  #     - name: Reassemble and upload to...
-  #       run: ...

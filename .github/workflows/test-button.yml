@@ -1,0 +1,15 @@
+name: Test Button
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_input:
+        description: 'Test input'
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Test: ${{ github.event.inputs.test_input }}"

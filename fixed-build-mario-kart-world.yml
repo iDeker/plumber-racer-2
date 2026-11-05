@@ -1,0 +1,312 @@
+name: Build Mario Kart World IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_dump_url:
+        description: 'Direct download URL for the game dump folder (base/ with exefs/ and romfs/)'
+        required: true
+        type: string
+      game_dump_sha256:
+        description: 'SHA256 of the downloaded dump (for verification)'
+        required: false
+        type: string
+      xcode_version:
+        description: 'Xcode version to use (15.4, 16.0, 16.1, etc.)'
+        required: false
+        default: '16.1'
+        type: choice
+        options:
+          - '15.4'
+          - '16.0'
+          - '16.1'
+          - '16.2'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GAME_TITLE_ID: 0400C3F00006E000
+  GAME_FOLDER_NAME: "Mario Kart World"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build IPA on macOS (Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode version
+        run: |
+          XCODE_VERSION="${{ github.event.inputs.xcode_version }}"
+          if [[ "$XCODE_VERSION" == "15.4" ]]; then
+            sudo xcode-select -s /Applications/Xcode_15.4.app
+          elif [[ "$XCODE_VERSION" == "16.0" ]]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app
+          elif [[ "$XCODE_VERSION" == "16.1" ]]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app
+          elif [[ "$XCODE_VERSION" == "16.2" ]]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          fi
+          xcodebuild -version
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> $GITHUB_ENV
+
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+
+      - name: Install Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install xcodegen zstd glslang
+          brew install --cask dotnet-sdk
+
+      - name: Setup Python and install packages
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/build_ipa_from_nsp.py
+
+      - name: Install Python packages
+        run: |
+          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+
+      - name: Download game dump
+        id: download
+        env:
+          GAME_DUMP_URL: ${{ github.event.inputs.game_dump_url }}
+          GAME_DUMP_SHA256: ${{ github.event.inputs.game_dump_sha256 }}
+        run: |
+          set -euo pipefail
+          echo "Downloading game dump from $GAME_DUMP_URL"
+          mkdir -p "$HOME/Games"
+          GAME_DIR="$HOME/Games/$GAME_FOLDER_NAME"
+          mkdir -p "$GAME_DIR"
+          if [[ "$GAME_DUMP_URL" == *"drive.google.com"* ]]; then
+            echo "Detected Google Drive link, using gdown..."
+            python3 -m pip install gdown
+            FILE_ID=$(echo "$GAME_DUMP_URL" | grep -oE '[-\w]{25,}' | head -1)
+            if [[ -z "$FILE_ID" ]]; then
+              FILE_ID=$(echo "$GAME_DUMP_URL" | grep -oE 'id=[^&]+' | cut -d= -f2)
+            fi
+            if [[ -z "$FILE_ID" ]]; then
+              echo "::error::Could not extract Google Drive file ID from URL"
+              exit 1
+            fi
+            gdown --folder "https://drive.google.com/drive/folders/$FILE_ID" -O "$GAME_DIR"
+          else
+            echo "Downloading with curl..."
+            ARCHIVE_PATH="$RUNNER_TEMP/game_dump.archive"
+            curl -L --fail --retry 3 --retry-delay 10 -o "$ARCHIVE_PATH" "$GAME_DUMP_URL"
+            if [[ -n "$GAME_DUMP_SHA256" ]]; then
+              echo "Verifying SHA256..."
+              DOWNLOADED_SHA256=$(sha256sum "$ARCHIVE_PATH" | cut -d' ' -f1)
+              if [[ "$DOWNLOADED_SHA256" != "$GAME_DUMP_SHA256" ]]; then
+                echo "::error::SHA256 mismatch! Expected $GAME_DUMP_SHA256, got $DOWNLOADED_SHA256"
+                exit 1
+              fi
+              echo "SHA256 verified."
+            fi
+            echo "Extracting..."
+            if [[ "$ARCHIVE_PATH" == *.tar.gz || "$ARCHIVE_PATH" == *.tgz ]]; then
+              tar -xzf "$ARCHIVE_PATH" -C "$GAME_DIR" --strip-components=1
+            elif [[ "$ARCHIVE_PATH" == *.zip ]]; then
+              unzip -q "$ARCHIVE_PATH" -d "$GAME_DIR"
+              SUBDIRS=("$GAME_DIR"/*/)
+              if [[ ${#SUBDIRS[@]} -eq 1 && -d "${SUBDIRS[0]}" ]]; then
+                mv "${SUBDIRS[0]}"/* "$GAME_DIR"/
+                rmdir "${SUBDIRS[0]}"
+              fi
+            else
+              echo "::error::Unknown archive format. Use .tar.gz, .tgz, or .zip"
+              exit 1
+            fi
+          fi
+          echo "Verifying game dump structure..."
+          REQUIRED_FILES=(
+            "base/exefs/main"
+            "base/exefs/main.npdm"
+            "base/exefs/rtld"
+            "base/exefs/sdk"
+            "base/exefs/subsdk0"
+            "base/romfs"
+          )
+          for f in "${REQUIRED_FILES[@]}"; do
+            if [[ ! -e "$GAME_DIR/$f" ]]; then
+              echo "::error::Missing required file: $f"
+              ls -la "$GAME_DIR/base/exefs/" 2>/dev/null || true
+              ls -la "$GAME_DIR/base/romfs/" 2>/dev/null | head -5 || true
+              exit 1
+            fi
+          done
+          echo "Verifying build IDs..."
+          MAIN_BUILD_ID=$(xxd -s 0x40 -l 16 -p "$GAME_DIR/base/exefs/main" | tr -d '\n')
+          SUBSDK0_BUILD_ID=$(xxd -s 0x40 -l 16 -p "$GAME_DIR/base/exefs/subsdk0" | tr -d '\n')
+          SDK_BUILD_ID=$(xxd -s 0x40 -l 16 -p "$GAME_DIR/base/exefs/sdk" | tr -d '\n')
+          echo "main build ID:      $MAIN_BUILD_ID"
+          echo "subsdk0 build ID:  $SUBSDK0_BUILD_ID"
+          echo "sdk build ID:      $SDK_BUILD_ID"
+          EXPECTED_MAIN="9e244438c3d8ef1c703a6a85ef99c4f0"
+          EXPECTED_SUBSDK0="d39a7a3d44530bb61b35690e5b0383d5"
+          EXPECTED_SDK="90ebba182862b9ecdc21fcb87b999012"
+          if [[ "$MAIN_BUILD_ID" != "$EXPECTED_MAIN" ]]; then
+            echo "::warning::main build ID mismatch! Expected $EXPECTED_MAIN, got $MAIN_BUILD_ID"
+          fi
+          if [[ "$SUBSDK0_BUILD_ID" != "$EXPECTED_SUBSDK0" ]]; then
+            echo "::warning::subsdk0 build ID mismatch! Expected $EXPECTED_SUBSDK0, got $SUBSDK0_BUILD_ID"
+          fi
+          if [[ "$SDK_BUILD_ID" != "$EXPECTED_SDK" ]]; then
+            echo "::warning::sdk build ID mismatch! Expected $EXPECTED_SDK, got $SDK_BUILD_ID"
+          fi
+          echo "GAME_DIR=$GAME_DIR" >> $GITHUB_OUTPUT
+          echo "Game dump verified at $GAME_DIR"
+
+      - name: Build IPA (first build compiles ~11,561 shaders, 20-30 min)
+        id: build
+        env:
+          GAME_DIR: ${{ steps.download.outputs.GAME_DIR }}
+        run: |
+          set -euo pipefail
+          echo "Starting build at $(date)"
+          echo "Game directory: $GAME_DIR"
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" \
+            --platform ios \
+            --romfs separate \
+            2>&1 | tee build.log
+          IPA_PATH=$(find "$GAME_DIR" -name "*.ipa" -type f | head -1)
+          ROMFS_PATH=$(find "$GAME_DIR" -name "RomFS.img" -type f | head -1)
+          if [[ -z "$IPA_PATH" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::IPA not found!"
+            ls -la "$GAME_DIR"/
+            exit 1
+          fi
+          echo "IPA_PATH=$IPA_PATH" >> $GITHUB_OUTPUT
+          echo "ROMFS_PATH=$ROMFS_PATH" >> $GITHUB_OUTPUT
+          IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1)
+          echo "IPA built: $IPA_PATH ($IPA_SIZE)"
+          if [[ -n "$ROMFS_PATH" && -f "$ROMFS_PATH" ]]; then
+            ROMFS_SIZE=$(du -h "$ROMFS_PATH" | cut -f1)
+            echo "RomFS.img: $ROMFS_PATH ($ROMFS_SIZE)"
+          else
+            echo "::warning::RomFS.img not found at expected location"
+          fi
+          echo "Build completed at $(date)"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: MarioKartWorld-ipa
+          path: ${{ steps.build.outputs.IPA_PATH }}
+          retention-days: 7
+          compression-level: 6
+
+      - name: Upload RomFS.img to GoFile.io
+        id: gofile
+        if: ${{ steps.build.outputs.ROMFS_PATH != '' }}
+        env:
+          ROMFS_PATH: ${{ steps.build.outputs.ROMFS_PATH }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$ROMFS_PATH" ]]; then
+            echo "RomFS.img not found, skipping upload"
+            exit 0
+          fi
+          ROMFS_SIZE=$(du -h "$ROMFS_PATH" | cut -f1)
+          ROMFS_SIZE_BYTES=$(stat -c%s "$ROMFS_PATH" 2>/dev/null || stat -f%z "$ROMFS_PATH")
+          echo "RomFS.img size: $ROMFS_SIZE ($ROMFS_SIZE_BYTES bytes)"
+          echo "Splitting RomFS.img into 2 parts for GoFile upload..."
+          SPLIT_DIR="$RUNNER_TEMP/romfs_parts"
+          mkdir -p "$SPLIT_DIR"
+          split -n 2 -d -a 1 "$ROMFS_PATH" "$SPLIT_DIR/RomFS.img.part"
+          PART_COUNT=$(ls "$SPLIT_DIR" | wc -l)
+          echo "Created $PART_COUNT parts"
+          echo "Getting GoFile server..."
+          SERVER_RESPONSE=$(curl -s "https://api.gofile.io/getServer")
+          SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['data']['server'])")
+          if [[ -z "$SERVER" || "$SERVER" == "None" ]]; then
+            echo "::error::Failed to get GoFile server"
+            echo "$SERVER_RESPONSE"
+            exit 1
+          fi
+          echo "Using GoFile server: $SERVER"
+          UPLOAD_URLS=()
+          for i in $(seq 0 $((PART_COUNT - 1))); do
+            PART_FILE="$SPLIT_DIR/RomFS.img.part$i"
+            PART_SIZE=$(du -h "$PART_FILE" | cut -f1)
+            echo "Uploading part $i ($PART_SIZE)..."
+            UPLOAD_RESPONSE=$(curl -s -F "file=@$PART_FILE" "https://${SERVER}.gofile.io/uploadFile")
+            echo "Upload response: $UPLOAD_RESPONSE"
+            DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if data.get('status') == 'ok':
+        print(data['data']['downloadPage'])
+    else:
+        print('ERROR: ' + data.get('message', 'unknown'))
+" 2>/dev/null)
+            if [[ "$DOWNLOAD_URL" == ERROR* ]]; then
+              echo "::error::Failed to upload part $i: $DOWNLOAD_URL"
+              exit 1
+            fi
+            echo "Part $i uploaded: $DOWNLOAD_URL"
+            UPLOAD_URLS+=("$DOWNLOAD_URL")
+          done
+          echo "GOFILE_URLS=${UPLOAD_URLS[*]}" >> $GITHUB_OUTPUT
+          echo "PART_COUNT=$PART_COUNT" >> $GITHUB_OUTPUT
+          cat > "$SPLIT_DIR/REASSEMBLE.txt" <<EOF
+RomFS.img was split into $PART_COUNT parts for GoFile.io upload (20 GB/file limit).
+Each part is ~11 GB.
+
+DOWNLOAD LINKS:
+$(for url in "${UPLOAD_URLS[@]}"; do echo "$url"; done)
+
+TO REASSEMBLE:
+1. Download all parts using the links above
+2. Save as: RomFS.img.part0, RomFS.img.part1
+3. Run: cat RomFS.img.part* > RomFS.img
+4. Verify: sha256sum RomFS.img (should match original if you have it)
+
+OR on Windows PowerShell:
+  cat RomFS.img.part0, RomFS.img.part1 > RomFS.img
+EOF
+          cat "$SPLIT_DIR/REASSEMBLE.txt"
+
+      - name: Build summary
+        run: |
+          echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**IPA:** \`MarioKartWorld.ipa\` (download from \`MarioKartWorld-ipa\` artifact)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**RomFS.img:** Uploaded to GoFile.io (2 parts, ~11 GB each)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${{ steps.gofile.outputs.GOFILE_URLS }}" ]]; then
+            echo "### RomFS.img Download Links" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for url in ${{ steps.gofile.outputs.GOFILE_URLS }}; do
+              echo "- $url" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Download \`MarioKartWorld-ipa\` artifact" >> $GITHUB_STEP_SUMMARY
+          echo "2. Download both RomFS.img parts from GoFile.io links above" >> $GITHUB_STEP_SUMMARY
+          echo "3. Reassemble: \`cat RomFS.img.part* > RomFS.img\` (or PowerShell: \`cat RomFS.img.part0, RomFS.img.part1 > RomFS.img\`)" >> $GITHUB_STEP_SUMMARY
+          echo "4. Install IPA via LiveContainer on iPhone" >> $GITHUB_STEP_SUMMARY
+          echo "5. Copy RomFS.img to LiveContainer Documents folder" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See [TUTORIAL.md](TUTORIAL.md) for detailed instructions."

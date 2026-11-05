@@ -1,0 +1,40 @@
+
+workflows:
+  macos-diagnostics:
+    name: Mac environment check
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+
+    environment:
+      xcode: 27.2
+
+    scripts:
+      - name: Check Mac hardware and storage
+        script: |
+          echo "=== macOS ==="
+          sw_vers
+
+          echo "=== Hardware ==="
+          system_profiler SPHardwareDataType
+
+          echo "=== Disk space ==="
+          df -h /
+
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcode-select -p
+          xcodebuild -showsdks
+
+          echo "=== Metal compiler ==="
+          xcrun --find metal
+
+          echo "=== Python ==="
+          python3 --version
+          python3 -c "import platform; print(platform.machine())"
+
+          echo "=== Build tools ==="
+          brew --version
+          dotnet --version || true
+          command -v xcodegen || true
+          command -v zstd || true
+          command -v glslangValidator || true
